@@ -17,16 +17,9 @@ from datasets import load_dataset
 
 import pickle
 
-print(torch.__version__)
+# use cpu to train
+device = torch.device("cpu")
 
-if torch.cuda.is_available():
-    device = torch.device(0)
-    print(f'There are {torch.cuda.device_count()} GPU(s) available.')
-    print('Device name:', torch.cuda.get_device_name(0))
-
-else:
-    print('No GPU available, using the CPU instead.')
-    device = torch.device("cpu")
 
 def load_datasethug():
     dataset = load_dataset("dair-ai/emotion")
@@ -158,7 +151,6 @@ class Dataloader_full():
 def mish(input):
     return input * torch.tanh(F.softplus(input))
 
-
 class Mish(nn.Module):
     def forward(self, input):
         return mish(input)
@@ -181,9 +173,9 @@ class EmoModel(nn.Module):
                 if layer.bias is not None:
                     layer.bias.data.zero_()
 
-    def forward(self, input_, *args):
-        X, attention_mask = input_
-        hidden_states = self.base_model(X, attention_mask=attention_mask)
+    def forward(self, input_ids, attention_mask, *args):
+
+        hidden_states = self.base_model(input_ids = input_ids, attention_mask=attention_mask)
         return self.classifier(hidden_states[0][:, 0, :])
 
 class RunModule():
@@ -231,9 +223,9 @@ class Distilroberta_base():
         print(last_hidden_state.shape)
 
 
-
 if __name__ == '__main__':
     name_model = 'distilroberta-base'
+
     processors = {
         "RoBert": Distilroberta_base
     }
@@ -241,7 +233,6 @@ if __name__ == '__main__':
     datasets = {
         "Dair-AI-Emo": EmoDataset
     }
-
 
     pocessor = processors["RoBert"]()
     dataset = datasets["Dair-AI-Emo"]
@@ -262,19 +253,21 @@ if __name__ == '__main__':
 
     print('Training ....')
     for epoch in tqdm(range(2)):
-        print('Epoch {}/{}'.format(epoch + 1, 2))
-        for batch in DLer.train_dataloader():
-            X, y = batch
-            idx = X[0]
-            add = X[1]
-            output = model(idx, add)
-            loss = loss(output, y)
+
+        print('Epoch {}/{}'.format(epoch + 1, 1))
+        model.train()
+        for batch in tqdm(DLer.train_dataloader()):
+            X, label = batch
+            input_ids, attention_mask = X
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            label = label.to(device)
+
+            output = model(input_ids, attention_mask)
+            loss = CEL(output, label)
 
             loss.backward()
             optimizer.step()
-
-            print(loss)
-
 
     # processor.example_model("I love you.")
 

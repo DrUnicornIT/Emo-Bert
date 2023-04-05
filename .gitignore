@@ -2,7 +2,10 @@
 __pycache__/
 *.py[cod]
 *$py.class
-.idea
+/.idea
+/data
+/model
+/tokenizer
 # C extensions
 *.so
 
