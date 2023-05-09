@@ -1,3 +1,7 @@
+import pandas as pd
+import numpy as np
+from typing import List
+from argparse import Namespace
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -6,96 +10,83 @@ from transformers import DistilBertTokenizer, AutoTokenizer, AutoModelWithLMHead
 from tokenizers import ByteLevelBPETokenizer
 from tokenizers.processors import BertProcessing
 from tqdm.notebook import tqdm
+import pytorch_lightning as pl
 
 
+BATCH_SIZE_DEFAULT = 64
 
-import os
-import pandas as pd
-from sklearn.metrics import  classification_report
+batch_size = BATCH_SIZE_DEFAULT
+from sklearn.metrics import classification_report
 import matplotlib.pyplot as plt
 from datasets import load_dataset
 
 import pickle
 
-# use cpu to train
 device = torch.device("cpu")
 
-
-def load_datasethug():
-    dataset = load_dataset("dair-ai/emotion")
-    print(dataset)
-    text = []
-    label = []
-
-    for line in dataset['train']:
-        text.append(line['text'])
-        label.append(line['label'])
-    dataset = pd.DataFrame({'text': text, 'label': label}, columns=['text', 'label'])
-    dataset.to_csv('data/DairAIEmo/train.csv', index=False)
-
-def load_tokenizer(model_name):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.save_pretrained("tokenizer/Distilroberta")
-
-def load_model(model_name):
-    model = AutoModelWithLMHead.from_pretrained(name_model)
-    model.save_pretrained('model/Distilroberta' , from_pt=True)
-class LoaderDairAIEmo():
-    def __init__(self):
-
-        super().__init__()
-        emotions = ["sadness", "joy", "love", "anger", "fear", "surprise"]
-        enum = {
-            "sadness": 0,
-            "joy": 1,
-            "love": 2,
-            "anger": 3,
-            "fear": 4,
-            "surprise": 5
-        }
-        def load_from_pickle(directory):
-            return pickle.load(open(directory, "rb"))
-
-        data = load_from_pickle(directory="data/DairAIEmo/merged_training.pkl")
-
-        data = data[data["emotions"].isin(emotions)]
-        print(type(data))
-        data.emotions.value_counts().plot.bar()
-        plt.show()
-
-        print(data.count())
-        print(data.head(10))
-        print(data.emotions.unique())
-
 #_____________________main______________________#
+
+class ContrastiveDataset(object):
+
+    def __init__(self):
+        self.data = []
+
+    def _read_file(self, input_file, type='SR_text'):
+        dataframe = pd.read_csv(input_file)
+        for line in dataframe:
+            self.data.append([line['text'], 0])
+            self.data.append([line[type], 0])
+        self.data = self.data[:int(len(self.data) / batch_size) * batch_size]
+
+    def _write_file(self, _index=False):
+        pd.DataFrame(self.data, columns=["text", "label"]).to_csv("contrastive/train_cl.csv")
+
+    def load(self):
+        self._read_file()
+        self._write_file()
+
+
+#---------------------- BUILD DATASET ----------------------------#
 class EmoDataset(Dataset):
 
     def __init__(self, path):
-
         super().__init__()
-        self.emotions = ["sadness", "joy", "love", "anger", "fear", "surprise"]
-        self.enum = {
-            "sadness": 0,
-            "joy": 1,
-            "love": 2,
-            "anger": 3,
-            "fear": 4,
-            "surprise": 5
-        }
         self.text_column = "text"
         self.label_column = "label"
         self.data = pd.read_csv(path, header=0, names=[self.text_column, self.label_column],
-                               engine="python")
+                                engine="python")
+
+        self.emotions = set(self.data[self.label_column])
+        self.enum = zip(self.emotions, range(len(self.emotions)))
+
     def list_emotions(self):
         return self.emotions
+
+    def list_enum(self):
+        return self.enum
+
+    def __getitem__(self, idx):
+        return self.data.loc[idx, self.text_column], self.enum[self.data.loc[idx, self.label_column]]
+
+    def __len__(self):
+        return self.data.shape[0]
+
+class ContrastiveDataset(Dataset):
+
+    def __init__(self, data):
+        super().__init__()
+        self.text_column = "text"
+        self.label_column = "label"
+        self.data = data
+
     def __getitem__(self, idx):
         return self.data.loc[idx, self.text_column], self.data.loc[idx, self.label_column]
 
     def __len__(self):
         return self.data.shape[0]
 
-
-class TokenizersCollateFn:
+#------------------Tokenizer----------------------#
+class RoBERTaTokenizersCollateFn:
     def __init__(self, path_tokenizer, max_tokens=512):
         ## RoBERTa uses BPE tokenizer similar to GPT
         t = ByteLevelBPETokenizer(
@@ -118,42 +109,18 @@ class TokenizersCollateFn:
 
         return (sequences_padded, attention_masks_padded), labels
 
-class Dataloader_full():
-    def __init__(self, dataset, batch_size, train_path, val_path, test_path, path_tokenizer):
-        super().__init__()
-        self.dataset = dataset
-        self.train_path = train_path
-        self.val_path = val_path
-        self.test_path = test_path
-        self.batch_size = batch_size
-        self.path_tokenizer = path_tokenizer
-        self.emotions = ["sadness", "joy", "love", "anger", "fear", "surprise"]
 
-    def list_emotions(self):
-        return self.emotions
-    def train_dataloader(self):
-        return self.create_data_loader(self.train_path, shuffle=True)
-
-    def val_dataloader(self):
-        return self.create_data_loader(self.val_path)
-
-    def test_dataloader(self):
-        return self.create_data_loader(self.test_path)
-
-    def create_data_loader(self, ds_path: str, shuffle=False):
-        return DataLoader(
-            self.dataset(ds_path),
-            batch_size=self.batch_size,
-            collate_fn=TokenizersCollateFn(self.path_tokenizer)
-        )
-
-
+#---------------------MODEL PYTORCHLIGHTNING------------------------------#
+@torch.jit.script
 def mish(input):
     return input * torch.tanh(F.softplus(input))
+
 
 class Mish(nn.Module):
     def forward(self, input):
         return mish(input)
+
+
 class EmoModel(nn.Module):
     def __init__(self, base_model, n_classes, base_model_output_size=768, dropout=0.05):
         super().__init__()
@@ -173,103 +140,243 @@ class EmoModel(nn.Module):
                 if layer.bias is not None:
                     layer.bias.data.zero_()
 
-    def forward(self, input_ids, attention_mask, *args):
+    def forward(self, input_, *args):
+        X, attention_mask = input_
+        hidden_states = self.base_model(X, attention_mask=attention_mask)
 
-        hidden_states = self.base_model(input_ids = input_ids, attention_mask=attention_mask)
         return self.classifier(hidden_states[0][:, 0, :])
 
-class RunModule():
-    def __init__(self, base_model, dataloader, num_epochs):
+
+class ContrastiveModule(pl.LightningModule):
+    def __init__(self, hparams, TokenizerFn, num_label):
         super().__init__()
-        self.model = EmoModel(base_model, len(dataloader.list_emotions()))
+        self.hparams.update(vars(hparams))
+        self.model = EmoModel(AutoModelWithLMHead.from_pretrained(self.hparams.name_path).base_model, num_label)
+        self.TokenizersCollateFn = TokenizerFn
+
+    def loss(self, output_layer):
+
+        def _dot_simililarity_dim1(x, y):
+            v = torch.matmul(torch.unsqueeze(x, 1), torch.unsqueeze(y, 2))
+            return v
+
+        def _dot_simililarity_dim2(x, y):
+            v = torch.tensordot(torch.unsqueeze(x, 1), torch.unsqueeze(torch.transpose(y, 0, 1), 0), dims=2)
+            return v
+
+        def get_negative_mask(batch_size):
+            negative_mask = np.ones((batch_size, 2 * batch_size), dtype=bool)
+            for i in range(batch_size):
+                negative_mask[i, i] = 0
+                negative_mask[i, i + batch_size] = 0
+            return torch.tensor(negative_mask)
+
+        criterion = torch.nn.CrossEntropyLoss()
+        negative_mask = get_negative_mask(int(batch_size / 2))
+        output_layer = output_layer.cpu()
+        output_layer = output_layer.detach().numpy()
+        zis = output_layer[::2]  # z0 z2 z4
+        zjs = output_layer[1::2]  # z1 z3 z5
+
+        zis = torch.from_numpy(zis)
+        zjs = torch.from_numpy(zjs)
+        zis = torch.nn.functional.normalize(zis, p=2, dim=1)
+
+        zjs = normalized = torch.nn.functional.normalize(zjs, p=2, dim=1)
+        l_pos = _dot_simililarity_dim1(zis, zjs)
+        l_pos = torch.reshape(l_pos, (int(batch_size / 2), 1))
+        l_pos /= 0.1
+
+        negatives = torch.cat([zjs, zis], dim=0)
+        loss = 0
+
+        for positives in [zis, zjs]:
+            l_neg = _dot_simililarity_dim2(positives, negatives)
+
+            labels = torch.zeros(int(batch_size / 2), dtype=torch.long)
+
+            l_neg = torch.masked_select(l_neg, negative_mask)
+            l_neg = torch.reshape(l_neg, (int(batch_size / 2), -1))
+            l_neg /= 0.1
+
+            logits = torch.cat([l_pos, l_neg], axis=1)  # [N,K+1]
+            loss += criterion(input=logits, target=labels)
+
+        loss_tf = loss / (batch_size)
+        loss_np = loss_tf.numpy()
+        loss_torch = torch.tensor(loss_np, dtype=torch.float32, requires_grad=True)
+
+        return loss_torch
+
+    def step(self, batch, step_name="train"):
+        if len(batch) != batch_size:
+            return
+        X, y = batch
+        loss = self.loss(self.forward(X), self.hparams.batch_size)
+        loss_key = f"{step_name}_loss"
+        tensorboard_logs = {loss_key: loss}
+
+        return {("loss" if step_name == "train" else loss_key): loss, 'log': tensorboard_logs,
+                "progress_bar": {loss_key: loss}}
+
+    def forward(self, X, *args):
+        return self.model(X, *args)
+
+    def training_step(self, batch, batch_idx):
+        return self.step(batch, "train")
+
+    def train_dataloader(self):
+        return self.create_data_loader(self.hparams.train_path, shuffle=False)
+
+    def create_data_loader(self, ds_path: str, shuffle=False):
+        return DataLoader(
+            ContrastiveDataset(ds_path),
+            batch_size=self.hparams.batch_size,
+            shuffle=shuffle,
+            collate_fn=self.TokenizersCollateFn(self.hparams.tokenizer_path)
+        )
+
+    def total_steps(self):
+        return len(self.train_dataloader()) // self.hparams.accumulate_grad_batches * self.hparams.epochs
+
+    def configure_optimizers(self):
+        optimizer = AdamW(self.model.parameters(), lr=self.hparams.lr)
+        lr_scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=self.hparams.warmup_steps,
+            num_training_steps=self.total_steps(),
+        )
+        return [optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
+
+
+class TrainingModule(pl.LightningModule):
+    def __init__(self, hparams):
+        super().__init__()
+        self.hparams.update(vars(hparams))
+        self.model = EmoModel(AutoModelWithLMHead.from_pretrained(self.hparams.name_path).base_model, self.hparams.num_labels)
+
         self.loss = nn.CrossEntropyLoss()
-        self.optimizer = AdamW(self.model.parameters(), lr=1e-4)
-        self.dataloader = dataloader
-        self.num_epochs = num_epochs
 
-    def Training(self):
-        print('Training ....')
-        for epoch in tqdm(range(self.num_epochs)):
-            print('Epoch {}/{}'.format(epoch + 1, self.num_epochs))
-            for batch in self.dataloader.train_dataloader():
-                X, y = batch
-                output = self.model(X)
-                loss = self.loss(output, y)
+    def step(self, batch, step_name="train"):
+        X, y = batch
+        loss = self.loss(self.forward(X), y)
+        loss_key = f"{step_name}_loss"
+        tensorboard_logs = {loss_key: loss}
 
-                loss.backward()
-                self.optimizer.step()
+        return {("loss" if step_name == "train" else loss_key): loss, 'log': tensorboard_logs,
+                "progress_bar": {loss_key: loss}}
 
-                print(loss)
-                break
+    def forward(self, X, *args):
+        return self.model(X, *args)
 
-class Distilroberta_base():
+    def training_step(self, batch, batch_idx):
+        return self.step(batch, "train")
 
-    def __init__(self):
-        super().__init__()
-        self.path_model = "model/Distilroberta"
-        self.path_tokenizer = "tokenizer/Distilroberta"
-        model = AutoModelWithLMHead.from_pretrained(self.path_model)
-        self.base_model = model.base_model
-        self.tokenizer = AutoTokenizer.from_pretrained(self.path_tokenizer)
+    def validation_step(self, batch, batch_idx):
+        return self.step(batch, "val")
 
-    def example_model(self, text = "I love you"):
-        print("Name model: %s" % {str(name_model)})
+    def validation_end(self, outputs: List[dict]):
+        loss = torch.stack([x["val_loss"] for x in outputs]).mean()
+        return {"val_loss": loss}
 
-        enc = self.tokenizer.encode_plus(text)
-        print(enc["input_ids"])
-        print(self.tokenizer.decode(enc["input_ids"]))
-        print(f"Length: {len(enc['input_ids'])}")
-        last_hidden_state = self.base_model(torch.tensor(enc["input_ids"]).unsqueeze(0))[0][0]
-        print(last_hidden_state.shape)
+    def test_step(self, batch, batch_idx):
+        return self.step(batch, "test")
+
+    def train_dataloader(self):
+        return self.create_data_loader(self.hparams.train_path, shuffle=True)
+
+    def val_dataloader(self):
+        return self.create_data_loader(self.hparams.val_path)
+
+    def test_dataloader(self):
+        return self.create_data_loader(self.hparams.test_path)
+
+    def create_data_loader(self, ds_path: str, shuffle=False):
+        return DataLoader(
+            EmoDataset(ds_path),
+            batch_size=self.hparams.batch_size,
+            shuffle=shuffle,
+            collate_fn=RoBERTaTokenizersCollateFn(self.hparams.tokenizer_path)
+        )
+
+    # @lru_cache()
+    def total_steps(self):
+        return len(self.train_dataloader()) // self.hparams.accumulate_grad_batches * self.hparams.epochs
+
+    def configure_optimizers(self):
+        optimizer = AdamW(self.model.parameters(), lr=self.hparams.lr)
+        lr_scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=self.hparams.warmup_steps,
+            num_training_steps=self.total_steps(),
+        )
+        return [optimizer], [{"scheduler": lr_scheduler, "interval": "step"}]
+
 
 
 if __name__ == '__main__':
+
+    train_cl = True
     name_model = 'distilroberta-base'
+    num_label = 6
+    Tokenizer = RoBERTaTokenizersCollateFn('tokenizer/Distilroberta')
 
-    processors = {
-        "RoBert": Distilroberta_base
-    }
+    if train_cl == True:
+        ContrastiveDataset.load()
+        print('Training Contrastive Learning ....')
 
-    datasets = {
-        "Dair-AI-Emo": EmoDataset
-    }
+        hparams = Namespace(
+            name_path="model/Distilroberta",
+            tokenizer_path="tokenizer/Distilroberta",
+            train_path="contrastive/train_cl.csv",
+            batch_size=64,
+            warmup_steps=100,
+            epochs=10,
+            lr=1e-4,
+            accumulate_grad_batches=1
+        )
+        module = ContrastiveModule(hparams, Tokenizer, 6)
+        trainer = pl.Trainer(max_epochs=hparams.epochs,
+                             accumulate_grad_batches=hparams.accumulate_grad_batches)
 
-    pocessor = processors["RoBert"]()
-    dataset = datasets["Dair-AI-Emo"]
+        trainer.fit(module)
 
-    DLer = Dataloader_full(dataset = dataset,
-                           batch_size = 32,
-                           train_path ="data/DairAIEmo/train.csv",
-                           val_path ="data/DairAIEmo/validation.csv",
-                           test_path ="data/DairAIEmo/test.csv",
-                           path_tokenizer="tokenizer/Distilroberta")
+    print('Training Tuning ....')
 
-    #train = RunModule(base_model = pocessor.base_model, dataloader = DLer, num_epochs = 1)
-    #train.Training()
+    hparams = Namespace(
+        name_path="model/Distilroberta",
+        tokenizer_path="tokenizer/Distilroberta",
+        train_path="data/DAIR-AI/Tuning/train.csv",
+        val_path="data/DAIR-AI/Tuning/dev.csv",
+        test_path="data/DAIR-AI/Tuning/test.csv",
+        batch_size=64,
+        warmup_steps=100,
+        epochs=10,
+        lr=1e-4,
+        accumulate_grad_batches=1
+    )
+    module = TrainingModule(hparams)
 
-    model = pocessor.base_model
-    CEL = nn.CrossEntropyLoss()
-    optimizer = AdamW(model.parameters(), lr=1e-4, eps=1e-8)
+    trainer = pl.Trainer(max_epochs=hparams.epochs,
+                         accumulate_grad_batches=hparams.accumulate_grad_batches)
 
-    print('Training ....')
-    for epoch in tqdm(range(2)):
+    trainer.fit(module)
 
-        print('Epoch {}/{}'.format(epoch + 1, 1))
-        model.train()
-        for batch in tqdm(DLer.train_dataloader()):
-            X, label = batch
-            input_ids, attention_mask = X
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            label = label.to(device)
+    with torch.no_grad():
+        progress = ["/", "-", "\\", "|", "/", "-", "\\", "|"]
+        module = module.to(device)
+        module.eval()
+        true_y, pred_y = [], []
+        for i, batch_ in enumerate(module.val_dataloader()):
+            (X, attn), y = batch_
+            batch = (X.to(device), attn.to(device))
+            print(progress[i % len(progress)], end="\r")
+            output = module(batch)
+            y_pred = torch.argmax(output, dim=1)
+            true_y.extend(y.cpu())
+            pred_y.extend(y_pred.cpu())
 
-            output = model(input_ids, attention_mask)
-            loss = CEL(output, label)
+    print("\n" + "_" * 80)
 
-            loss.backward()
-            optimizer.step()
+    print(classification_report(true_y, pred_y))
 
-    # processor.example_model("I love you.")
-
-    # data = EmoDataset("data/train.csv")
-    # print(data[1])
