@@ -22,24 +22,35 @@ from datasets import load_dataset
 
 import pickle
 
-device = torch.device("cpu")
+#------------ CPU + GPU -------------#
+if torch.cuda.is_available():
+    device = torch.device(0)
+    print(f'There are {torch.cuda.device_count()} GPU(s) available.')
+    print('Device name:', torch.cuda.get_device_name(0))
+
+else:
+    print('No GPU available, using the CPU instead.')
+    device = torch.device("cpu")
+
 
 #_____________________main______________________#
 
-class ContrastiveDataset(object):
+class ContrastiveDataBuilder(object):
 
-    def __init__(self):
+    def __init__(self, path):
         self.data = []
+        self.path = path
+        self.save_path = "contrastive/train_cl.csv"
 
-    def _read_file(self, input_file, type='SR_text'):
-        dataframe = pd.read_csv(input_file)
-        for line in dataframe:
-            self.data.append([line['text'], 0])
-            self.data.append([line[type], 0])
+    def _read_file(self, type='SR_text'):
+        dataframe = pd.read_csv(self.path)
+        for id in dataframe.index:
+            self.data.append([dataframe['text'][id], 0])
+            self.data.append([dataframe[type][id], 0])
         self.data = self.data[:int(len(self.data) / batch_size) * batch_size]
 
     def _write_file(self, _index=False):
-        pd.DataFrame(self.data, columns=["text", "label"]).to_csv("contrastive/train_cl.csv")
+        pd.DataFrame(self.data, columns=["text", "label"]).to_csv(self.save_path, index=False)
 
     def load(self):
         self._read_file()
@@ -56,9 +67,10 @@ class EmoDataset(Dataset):
         self.data = pd.read_csv(path, header=0, names=[self.text_column, self.label_column],
                                 engine="python")
 
-        self.emotions = set(self.data[self.label_column])
-        self.enum = zip(self.emotions, range(len(self.emotions)))
+        self.emotions = list(set(self.data[self.label_column]))
 
+        self.enum = {emo:id for id, emo in enumerate(self.emotions)}
+        # print(self.enum)
     def list_emotions(self):
         return self.emotions
 
@@ -73,11 +85,11 @@ class EmoDataset(Dataset):
 
 class ContrastiveDataset(Dataset):
 
-    def __init__(self, data):
+    def __init__(self, path):
         super().__init__()
         self.text_column = "text"
         self.label_column = "label"
-        self.data = data
+        self.data = pd.read_csv(path)
 
     def __getitem__(self, idx):
         return self.data.loc[idx, self.text_column], self.data.loc[idx, self.label_column]
@@ -87,8 +99,9 @@ class ContrastiveDataset(Dataset):
 
 #------------------Tokenizer----------------------#
 class RoBERTaTokenizersCollateFn:
-    def __init__(self, path_tokenizer, max_tokens=512):
+    def __init__(self, max_tokens=128):
         ## RoBERTa uses BPE tokenizer similar to GPT
+        path_tokenizer = 'tokenizer/Distilroberta'
         t = ByteLevelBPETokenizer(
             str(path_tokenizer) + "/vocab.json",
             str(path_tokenizer) + "/merges.txt"
@@ -148,10 +161,10 @@ class EmoModel(nn.Module):
 
 
 class ContrastiveModule(pl.LightningModule):
-    def __init__(self, hparams, TokenizerFn, num_label):
+    def __init__(self, hparams, TokenizerFn):
         super().__init__()
         self.hparams.update(vars(hparams))
-        self.model = EmoModel(AutoModelWithLMHead.from_pretrained(self.hparams.name_path).base_model, num_label)
+        self.model = EmoModel(AutoModelWithLMHead.from_pretrained(self.hparams.name_path).base_model, self.hparams.num_label)
         self.TokenizersCollateFn = TokenizerFn
 
     def loss(self, output_layer):
@@ -233,7 +246,7 @@ class ContrastiveModule(pl.LightningModule):
             ContrastiveDataset(ds_path),
             batch_size=self.hparams.batch_size,
             shuffle=shuffle,
-            collate_fn=self.TokenizersCollateFn(self.hparams.tokenizer_path)
+            collate_fn=self.TokenizersCollateFn()
         )
 
     def total_steps(self):
@@ -250,11 +263,15 @@ class ContrastiveModule(pl.LightningModule):
 
 
 class TrainingModule(pl.LightningModule):
-    def __init__(self, hparams):
+    def __init__(self, hparams, Tokenizer, model = None):
         super().__init__()
         self.hparams.update(vars(hparams))
-        self.model = EmoModel(AutoModelWithLMHead.from_pretrained(self.hparams.name_path).base_model, self.hparams.num_labels)
 
+        if model == None:
+            self.model = EmoModel(AutoModelWithLMHead.from_pretrained(self.hparams.name_path).base_model, self.hparams.num_labels)
+        else:
+            self.model = model
+        self.TokenizersCollateFn = Tokenizer
         self.loss = nn.CrossEntropyLoss()
 
     def step(self, batch, step_name="train"):
@@ -296,7 +313,7 @@ class TrainingModule(pl.LightningModule):
             EmoDataset(ds_path),
             batch_size=self.hparams.batch_size,
             shuffle=shuffle,
-            collate_fn=RoBERTaTokenizersCollateFn(self.hparams.tokenizer_path)
+            collate_fn=self.TokenizersCollateFn()
         )
 
     # @lru_cache()
@@ -316,26 +333,30 @@ class TrainingModule(pl.LightningModule):
 
 if __name__ == '__main__':
 
-    train_cl = True
+    train_cl = False
     name_model = 'distilroberta-base'
     num_label = 6
-    Tokenizer = RoBERTaTokenizersCollateFn('tokenizer/Distilroberta')
 
+    path_data = "data/DAIR-AI/"
+
+    Tokenizer = RoBERTaTokenizersCollateFn
+    CL = ContrastiveDataBuilder(path_data + "CL/train.csv")
+    module = None
     if train_cl == True:
-        ContrastiveDataset.load()
+        CL.load()
         print('Training Contrastive Learning ....')
 
         hparams = Namespace(
             name_path="model/Distilroberta",
-            tokenizer_path="tokenizer/Distilroberta",
             train_path="contrastive/train_cl.csv",
             batch_size=64,
             warmup_steps=100,
-            epochs=10,
+            epochs=1,
             lr=1e-4,
+            num_label = 6,
             accumulate_grad_batches=1
         )
-        module = ContrastiveModule(hparams, Tokenizer, 6)
+        module = ContrastiveModule(hparams, Tokenizer)
         trainer = pl.Trainer(max_epochs=hparams.epochs,
                              accumulate_grad_batches=hparams.accumulate_grad_batches)
 
@@ -345,17 +366,18 @@ if __name__ == '__main__':
 
     hparams = Namespace(
         name_path="model/Distilroberta",
-        tokenizer_path="tokenizer/Distilroberta",
-        train_path="data/DAIR-AI/Tuning/train.csv",
-        val_path="data/DAIR-AI/Tuning/dev.csv",
-        test_path="data/DAIR-AI/Tuning/test.csv",
+        train_path= path_data + "Tuning/train.csv",
+        val_path= path_data + "Tuning/dev.csv",
+        test_path=path_data + "Tuning/test.csv",
         batch_size=64,
         warmup_steps=100,
-        epochs=10,
+        epochs=1,
+        num_labels = 6,
         lr=1e-4,
         accumulate_grad_batches=1
     )
-    module = TrainingModule(hparams)
+    print(module)
+    module = TrainingModule(hparams, Tokenizer, module)
 
     trainer = pl.Trainer(max_epochs=hparams.epochs,
                          accumulate_grad_batches=hparams.accumulate_grad_batches)
@@ -379,4 +401,3 @@ if __name__ == '__main__':
     print("\n" + "_" * 80)
 
     print(classification_report(true_y, pred_y))
-
